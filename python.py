@@ -5,6 +5,14 @@ import pandas as pd
 from google import genai
 from google.genai.errors import APIError
 
+# [MỚI] OpenAI SDK cho ChatGPT
+# Cài đặt nếu cần: pip install openai>=1.40.0
+try:
+    from openai import OpenAI
+    _OPENAI_AVAILABLE = True
+except Exception:
+    _OPENAI_AVAILABLE = False
+
 # --- Cấu hình Trang Streamlit ---
 st.set_page_config(
     page_title="App Phân Tích Báo Cáo Tài Chính",
@@ -183,3 +191,99 @@ if uploaded_file is not None:
 
 else:
     st.info("Vui lòng tải lên file Excel để bắt đầu phân tích.")
+
+# ======================================================================
+# [MỚI] KHUNG CHAT VỚI CHATGPT (không ảnh hưởng các phần trên)
+# ======================================================================
+
+st.markdown("---")
+st.subheader("💬 Khung Chat với ChatGPT")
+
+# Tuỳ chọn cấu hình nhanh
+with st.expander("⚙️ Cấu hình Chat (tuỳ chọn)", expanded=False):
+    st.caption("Bạn có thể để mặc định. Nhớ thêm OPENAI_API_KEY vào Secrets hoặc biến môi trường.")
+    model = st.selectbox(
+        "Chọn model",
+        options=["gpt-4o-mini", "gpt-4.1-mini", "gpt-4o", "gpt-4.1"],
+        index=0,
+        help="Model nhẹ (mini) rẻ & nhanh; model lớn trả lời tốt hơn nhưng tốn phí hơn."
+    )
+    system_prompt = st.text_area(
+        "System prompt",
+        value=(
+            "Bạn là ChatGPT, một trợ lý lập trình Python và phân tích dữ liệu dày dạn kinh nghiệm. "
+            "Ưu tiên trả lời ngắn gọn, code tối giản, có thể chạy được trên Streamlit. "
+            "Khi được hỏi về tài chính, giải thích rõ ràng, tránh khẳng định khi thiếu dữ liệu."
+        ),
+        height=100
+    )
+
+# Khởi tạo bộ nhớ hội thoại
+if "chat_messages" not in st.session_state:
+    st.session_state.chat_messages = [
+        {"role": "system", "content": "Bạn là một trợ lý thân thiện và hữu ích."}
+    ]
+
+# Hiển thị lịch sử hội thoại (ẩn system)
+for msg in [m for m in st.session_state.chat_messages if m["role"] != "system"]:
+    with st.chat_message("user" if msg["role"] == "user" else "assistant"):
+        st.markdown(msg["content"])
+
+# Ô nhập chat
+user_input = st.chat_input("Nhập câu hỏi cho ChatGPT...")
+
+def _call_chatgpt(api_key: str, model_name: str, sys_prompt: str, messages: list[str]) -> str:
+    """
+    Gọi OpenAI Chat Completions API (SDK openai>=1.x).
+    Trả về nội dung trả lời dạng chuỗi. Quấn try/except để an toàn.
+    """
+    try:
+        client = OpenAI(api_key=api_key) if api_key else OpenAI()  # ưu tiên secrets, fallback env
+        # Chèn system prompt ở đầu (ghi đè system mặc định)
+        msgs = [{"role": "system", "content": sys_prompt}] + [
+            {"role": m["role"], "content": m["content"]}
+            for m in messages
+            if m["role"] in ("user", "assistant")
+        ]
+        resp = client.chat.completions.create(
+            model=model_name,
+            messages=msgs,
+            temperature=0.2,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        return f"⚠️ Không thể gọi ChatGPT: {e}"
+
+if user_input is not None:
+    # Lưu và hiển thị tin nhắn người dùng
+    st.session_state.chat_messages.append({"role": "user", "content": user_input})
+    with st.chat_message("user"):
+        st.markdown(user_input)
+
+    # Lấy API key
+    openai_key = st.secrets.get("OPENAI_API_KEY", None)
+
+    if not _OPENAI_AVAILABLE:
+        assistant_reply = (
+            "⚠️ Thiếu thư viện OpenAI. Hãy thêm vào requirements.txt: `openai>=1.40.0` "
+            "và deploy lại ứng dụng."
+        )
+    elif not (openai_key or "OPENAI_API_KEY" in st.secrets or True):
+        # vẫn thử dùng biến môi trường nếu không có trong secrets
+        assistant_reply = (
+            "⚠️ Chưa cấu hình `OPENAI_API_KEY`. Vui lòng thêm vào `st.secrets` "
+            "hoặc đặt biến môi trường `OPENAI_API_KEY`."
+        )
+    else:
+        with st.chat_message("assistant"):
+            with st.spinner("ChatGPT đang soạn trả lời..."):
+                assistant_reply = _call_chatgpt(
+                    api_key=openai_key,
+                    model_name=model,
+                    sys_prompt=system_prompt,
+                    messages=st.session_state.chat_messages,
+                )
+                st.markdown(assistant_reply)
+
+    # Lưu trả lời vào lịch sử
+    st.session_state.chat_messages.append({"role": "assistant", "content": assistant_reply})
