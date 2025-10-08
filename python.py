@@ -5,14 +5,6 @@ import pandas as pd
 from google import genai
 from google.genai.errors import APIError
 
-# [MỚI] OpenAI SDK cho ChatGPT
-# Cài đặt nếu cần: pip install openai>=1.40.0
-try:
-    from openai import OpenAI
-    _OPENAI_AVAILABLE = True
-except Exception:
-    _OPENAI_AVAILABLE = False
-
 # --- Cấu hình Trang Streamlit ---
 st.set_page_config(
     page_title="App Phân Tích Báo Cáo Tài Chính",
@@ -61,7 +53,7 @@ def process_financial_data(df):
     
     return df
 
-# --- Hàm gọi API Gemini ---
+# --- Hàm gọi API Gemini (phân tích tài chính) ---
 def get_ai_analysis(data_for_ai, api_key):
     """Gửi dữ liệu phân tích đến Gemini API và nhận nhận xét."""
     try:
@@ -193,97 +185,105 @@ else:
     st.info("Vui lòng tải lên file Excel để bắt đầu phân tích.")
 
 # ======================================================================
-# [MỚI] KHUNG CHAT VỚI CHATGPT (không ảnh hưởng các phần trên)
+# 💬 KHUNG CHAT VỚI GEMINI (dùng GEMINI_API_KEY của a)
 # ======================================================================
 
 st.markdown("---")
-st.subheader("💬 Khung Chat với ChatGPT")
+st.subheader("💬 Khung Chat với Gemini")
 
 # Tuỳ chọn cấu hình nhanh
 with st.expander("⚙️ Cấu hình Chat (tuỳ chọn)", expanded=False):
-    st.caption("Bạn có thể để mặc định. Nhớ thêm OPENAI_API_KEY vào Secrets hoặc biến môi trường.")
+    st.caption("Mặc định: gemini-2.5-flash. Có thể đổi nếu a muốn.")
     model = st.selectbox(
         "Chọn model",
-        options=["gpt-4o-mini", "gpt-4.1-mini", "gpt-4o", "gpt-4.1"],
-        index=0,
-        help="Model nhẹ (mini) rẻ & nhanh; model lớn trả lời tốt hơn nhưng tốn phí hơn."
+        options=["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-2.5-pro"],
+        index=0
     )
     system_prompt = st.text_area(
         "System prompt",
         value=(
-            "Bạn là ChatGPT, một trợ lý lập trình Python và phân tích dữ liệu dày dạn kinh nghiệm. "
-            "Ưu tiên trả lời ngắn gọn, code tối giản, có thể chạy được trên Streamlit. "
-            "Khi được hỏi về tài chính, giải thích rõ ràng, tránh khẳng định khi thiếu dữ liệu."
+            "Bạn là trợ lý lập trình Python & chuyên gia Streamlit. "
+            "Trả lời ngắn gọn, kèm ví dụ chạy được khi phù hợp. "
+            "Nếu câu hỏi liên quan đến tài chính, giải thích rõ giả định và nguồn số liệu."
         ),
         height=100
     )
+    max_history = st.slider("Số lượt hội thoại gần nhất đưa vào ngữ cảnh", 2, 20, 12)
 
 # Khởi tạo bộ nhớ hội thoại
 if "chat_messages" not in st.session_state:
-    st.session_state.chat_messages = [
-        {"role": "system", "content": "Bạn là một trợ lý thân thiện và hữu ích."}
-    ]
+    st.session_state.chat_messages = []  # chỉ lưu user/assistant
 
-# Hiển thị lịch sử hội thoại (ẩn system)
-for msg in [m for m in st.session_state.chat_messages if m["role"] != "system"]:
+# Hiển thị lịch sử
+for msg in st.session_state.chat_messages:
     with st.chat_message("user" if msg["role"] == "user" else "assistant"):
         st.markdown(msg["content"])
 
-# Ô nhập chat
-user_input = st.chat_input("Nhập câu hỏi cho ChatGPT...")
-
-def _call_chatgpt(api_key: str, model_name: str, sys_prompt: str, messages: list[str]) -> str:
+def _format_history_for_prompt(history: list[dict], system_prompt: str, last_user: str) -> str:
     """
-    Gọi OpenAI Chat Completions API (SDK openai>=1.x).
-    Trả về nội dung trả lời dạng chuỗi. Quấn try/except để an toàn.
+    Gom lịch sử hội thoại thành một prompt chuỗi cho Gemini.
+    Dạng:
+    [SYSTEM] ...
+    [USER] ...
+    [ASSISTANT] ...
+    ...
+    [USER] <last_user>
+    [ASSISTANT]
+    """
+    lines = [f"[SYSTEM]\n{system_prompt.strip()}".strip(), ""]
+    for turn in history[-max_history:]:
+        if turn["role"] == "user":
+            lines.append(f"[USER]\n{turn['content']}\n")
+        else:
+            lines.append(f"[ASSISTANT]\n{turn['content']}\n")
+    # thêm câu mới của user
+    lines.append(f"[USER]\n{last_user}\n")
+    lines.append("[ASSISTANT]\n")
+    return "\n".join(lines).strip()
+
+def _call_gemini_chat(api_key: str, model_name: str, system_prompt: str, history: list[dict], user_text: str) -> str:
+    """
+    Gọi Gemini bằng generate_content. Gom lịch sử vào 1 prompt văn bản.
+    Trả về chuỗi trả lời.
     """
     try:
-        client = OpenAI(api_key=api_key) if api_key else OpenAI()  # ưu tiên secrets, fallback env
-        # Chèn system prompt ở đầu (ghi đè system mặc định)
-        msgs = [{"role": "system", "content": sys_prompt}] + [
-            {"role": m["role"], "content": m["content"]}
-            for m in messages
-            if m["role"] in ("user", "assistant")
-        ]
-        resp = client.chat.completions.create(
+        client = genai.Client(api_key=api_key)
+        prompt_text = _format_history_for_prompt(history, system_prompt, user_text)
+        resp = client.models.generate_content(
             model=model_name,
-            messages=msgs,
-            temperature=0.2,
+            contents=prompt_text,
         )
-        return resp.choices[0].message.content.strip()
+        return (resp.text or "").strip()
+    except APIError as e:
+        return f"⚠️ Lỗi gọi Gemini API: {e}"
     except Exception as e:
-        return f"⚠️ Không thể gọi ChatGPT: {e}"
+        return f"⚠️ Lỗi không xác định khi gọi Gemini: {e}"
 
-if user_input is not None:
-    # Lưu và hiển thị tin nhắn người dùng
+# Ô nhập chat
+user_input = st.chat_input("Nhập câu hỏi cho Gemini...")
+
+if user_input:
+    # Lưu & hiển thị tin nhắn người dùng
     st.session_state.chat_messages.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    # Lấy API key
-    openai_key = st.secrets.get("OPENAI_API_KEY", None)
+    api_key = st.secrets.get("GEMINI_API_KEY")
 
-    if not _OPENAI_AVAILABLE:
-        assistant_reply = (
-            "⚠️ Thiếu thư viện OpenAI. Hãy thêm vào requirements.txt: `openai>=1.40.0` "
-            "và deploy lại ứng dụng."
-        )
-    elif not (openai_key or "OPENAI_API_KEY" in st.secrets or True):
-        # vẫn thử dùng biến môi trường nếu không có trong secrets
-        assistant_reply = (
-            "⚠️ Chưa cấu hình `OPENAI_API_KEY`. Vui lòng thêm vào `st.secrets` "
-            "hoặc đặt biến môi trường `OPENAI_API_KEY`."
-        )
+    if not api_key:
+        assistant_reply = "⚠️ Chưa cấu hình `GEMINI_API_KEY` trong Secrets."
+        with st.chat_message("assistant"):
+            st.markdown(assistant_reply)
+        st.session_state.chat_messages.append({"role": "assistant", "content": assistant_reply})
     else:
         with st.chat_message("assistant"):
-            with st.spinner("ChatGPT đang soạn trả lời..."):
-                assistant_reply = _call_chatgpt(
-                    api_key=openai_key,
+            with st.spinner("Gemini đang soạn trả lời..."):
+                assistant_reply = _call_gemini_chat(
+                    api_key=api_key,
                     model_name=model,
-                    sys_prompt=system_prompt,
-                    messages=st.session_state.chat_messages,
-                )
+                    system_prompt=system_prompt,
+                    history=st.session_state.chat_messages[:-1],  # lịch sử trước câu vừa nhập
+                    user_text=user_input,
+                ) or "Mình chưa nhận được nội dung trả lời hợp lệ."
                 st.markdown(assistant_reply)
-
-    # Lưu trả lời vào lịch sử
-    st.session_state.chat_messages.append({"role": "assistant", "content": assistant_reply})
+        st.session_state.chat_messages.append({"role": "assistant", "content": assistant_reply})
